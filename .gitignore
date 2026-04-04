@@ -1,0 +1,13 @@
+.vs
+build
+*/build
+*.pdb
+*.exe
+*.obj
+*.idb
+*.ipch
+*.tlog
+*.log
+*.user
+imgui.ini
+data/

@@ -1,0 +1,44 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build Debug x64",
+      "type": "shell",
+      "command": ".\\build.ps1",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      },
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "Build Release x64",
+      "type": "shell",
+      "command": ".\\build.ps1 -Config Release",
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      },
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "Clean x64",
+      "type": "shell",
+      "command": ".\\build.ps1 -Clean",
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      },
+      "problemMatcher": []
+    }
+  ]
+}
