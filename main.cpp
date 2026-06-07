@@ -405,7 +405,7 @@ int main(int argc, char* argv[])
 	// Create data directory next to executable
 	std::filesystem::create_directories("data");
 
-	// Bootstrap arcdps directory structure
+	// Prepare arcdps directories for monitor startup.
 	{
 		auto arcdps_path = std::filesystem::absolute("data/arcdps");
 		std::filesystem::create_directories(arcdps_path);
@@ -420,7 +420,8 @@ int main(int argc, char* argv[])
 				f << ini_content;
 		}
 
-		printf("[MOCK] Log directory: %s\n", (arcdps_path / "arcdps.cbtlogs").string().c_str());
+		auto log_directory = (arcdps_path / "arcdps.cbtlogs").string();
+		printf("[MOCK] Log directory: %s\n", log_directory.c_str());
 	}
 
 	// Create window
@@ -431,8 +432,9 @@ int main(int argc, char* argv[])
 	auto dll_name = std::filesystem::path(dll_path).stem().string();
 	auto title = "Nexus Mock - " + dll_name;
 	std::wstring wide_title(title.begin(), title.end());
+	const wchar_t* wide_title_text = wide_title.c_str();
 
-	HWND hwnd = CreateWindow(wc.lpszClassName, wide_title.c_str(), WS_OVERLAPPEDWINDOW, 100, 100, 1280, 800, nullptr, nullptr, wc.hInstance, nullptr);
+	HWND hwnd = CreateWindow(wc.lpszClassName, wide_title_text, WS_OVERLAPPEDWINDOW, 100, 100, 1280, 800, nullptr, nullptr, wc.hInstance, nullptr);
 
 	if (!CreateDeviceD3D(hwnd))
 	{
