@@ -1,0 +1,39 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "mac-mock-debug",
+      "displayName": "macOS Native Mock Debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/../build/mac-mock-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "CMAKE_TOOLCHAIN_FILE": "$env{HOME}/vcpkg/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "arm64-osx"
+      }
+    },
+    {
+      "name": "mac-mock-release",
+      "displayName": "macOS Native Mock Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/../build/mac-mock-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "CMAKE_TOOLCHAIN_FILE": "$env{HOME}/vcpkg/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "arm64-osx"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "mac-mock-debug",
+      "configurePreset": "mac-mock-debug"
+    },
+    {
+      "name": "mac-mock-release",
+      "configurePreset": "mac-mock-release"
+    }
+  ]
+}
