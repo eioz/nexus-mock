@@ -388,7 +388,32 @@ static void render_alerts()
 
 // --- Mock control panel ---
 
-static void render_mock_controls()
+static bool resize_client_area(HWND hwnd, int width, int height)
+{
+	RECT rect{ 0, 0, width, height };
+	const DWORD style = static_cast<DWORD>(GetWindowLongPtr(hwnd, GWL_STYLE));
+	const DWORD extended_style = static_cast<DWORD>(GetWindowLongPtr(hwnd, GWL_EXSTYLE));
+	if (!AdjustWindowRectEx(
+			&rect,
+			style,
+			GetMenu(hwnd) != nullptr,
+			extended_style))
+	{
+		return false;
+	}
+	if (IsIconic(hwnd) || IsZoomed(hwnd))
+		ShowWindow(hwnd, SW_RESTORE);
+	return SetWindowPos(
+		hwnd,
+		nullptr,
+		0,
+		0,
+		rect.right - rect.left,
+		rect.bottom - rect.top,
+		SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) != FALSE;
+}
+
+static void render_mock_controls(HWND hwnd)
 {
 	auto& state = get_mock_state();
 
@@ -408,6 +433,14 @@ static void render_mock_controls()
 		ImGui::Separator();
 		ImGui::Text("Window: %ux%u", state.nexus_link_data.Width, state.nexus_link_data.Height);
 		ImGui::Text("Scaling: %.1f", state.nexus_link_data.Scaling);
+		for (auto [width, height] : { std::pair{ 1280, 800 }, std::pair{ 1920, 1080 }, std::pair{ 860, 480 } })
+		{
+			auto label = std::to_string(width) + "x" + std::to_string(height);
+			if (ImGui::Button(label.c_str()) && !resize_client_area(hwnd, width, height))
+				printf("[MOCK] ERROR: Failed to resize client area (error %lu).\n", GetLastError());
+			ImGui::SameLine();
+		}
+		ImGui::NewLine();
 
 		ImGui::Spacing();
 		ImGui::Text("Keybinds");
@@ -648,7 +681,7 @@ int main(int argc, char* argv[])
 			cb();
 
 		if (!launch_options.hide_mock_controls)
-			render_mock_controls();
+			render_mock_controls(hwnd);
 
 		for (auto& cb : render_cbs)
 			cb();
