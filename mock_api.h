@@ -68,6 +68,7 @@ struct MockState
 	std::map<std::string, std::vector<uint8_t>> shared_blocks;
 
 	Mumble::Data mumble_data = {};
+	Mumble::Identity mumble_identity = {};
 	NexusLinkData nexus_link_data = {};
 };
 

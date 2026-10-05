@@ -413,6 +413,35 @@ static bool resize_client_area(HWND hwnd, int width, int height)
 		SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) != FALSE;
 }
 
+// a character standing at the origin, with the camera behind and above it
+static void populate_mumble(MockState& state)
+{
+	auto& mumble = state.mumble_data;
+	mumble.UIVersion = 2;
+	mumble.UITick = 1;
+	wcscpy_s(mumble.Name, L"Guild Wars 2");
+	mumble.AvatarFront = { 0.f, 0.f, 1.f };
+	mumble.CameraPosition = { 0.f, 3.f, -8.f };
+	mumble.CameraFront = { 0.f, -0.2425f, 0.9701f };
+	wcscpy_s(mumble.Identity, LR"({"name":"Mock Character","profession":1,"spec":62,"race":2,"map_id":50,"world_id":0,"team_color_id":0,"commander":false,"fov":1.222,"uisz":1})");
+	mumble.ContextLength = 48;
+	mumble.Context.MapID = 50;
+	mumble.Context.MapType = Mumble::EMapType::Public;
+	mumble.Context.ShardID = 1;
+	mumble.Context.InstanceID = 1;
+	mumble.Context.IsGameFocused = 1;
+	mumble.Context.ProcessID = GetCurrentProcessId();
+
+	auto& identity = state.mumble_identity;
+	strcpy_s(identity.Name, "Mock Character");
+	identity.Profession = Mumble::EProfession::Guardian;
+	identity.Specialization = 62;
+	identity.Race = Mumble::ERace::Human;
+	identity.MapID = 50;
+	identity.FOV = 1.222f;
+	identity.UISize = Mumble::EUIScale::Normal;
+}
+
 static void render_mock_controls(HWND hwnd)
 {
 	auto& state = get_mock_state();
@@ -427,6 +456,12 @@ static void render_mock_controls(HWND hwnd)
 		bool in_combat = state.mumble_data.Context.IsInCombat;
 		if (ImGui::Checkbox("In Combat", &in_combat))
 			state.mumble_data.Context.IsInCombat = in_combat ? 1 : 0;
+
+		bool map_open = state.mumble_data.Context.IsMapOpen;
+		if (ImGui::Checkbox("Map Open", &map_open))
+			state.mumble_data.Context.IsMapOpen = map_open ? 1 : 0;
+
+		ImGui::Text("UI Tick: %u", state.mumble_data.UITick);
 
 		ImGui::Spacing();
 		ImGui::Text("Nexus Link");
@@ -586,6 +621,7 @@ int main(int argc, char* argv[])
 	state.nexus_link_data.Height = client_rect.bottom - client_rect.top;
 	state.nexus_link_data.Scaling = 1.0f;
 	state.nexus_link_data.IsGameplay = true;
+	populate_mumble(state);
 
 	// Keep the default body stable for scripted tests; optional fonts match Nexus's native sizes.
 	ImFont* body_font = launch_options.font_file.empty() ? io.Fonts->AddFontDefault() : io.Fonts->AddFontFromFileTTF(launch_options.font_file.c_str(), 15.f);
@@ -664,6 +700,7 @@ int main(int argc, char* argv[])
 		GetClientRect(hwnd, &client_rect);
 		state.nexus_link_data.Width = client_rect.right - client_rect.left;
 		state.nexus_link_data.Height = client_rect.bottom - client_rect.top;
+		state.mumble_data.UITick++;
 
 		ImGui_ImplDX11_NewFrame();
 		ImGui_ImplWin32_NewFrame();

@@ -126,6 +126,8 @@ static void* mock_datalink_get(const char* identifier)
 	auto& state = get_mock_state();
 	if (strcmp(identifier, "DL_MUMBLE_LINK") == 0)
 		return &state.mumble_data;
+	if (strcmp(identifier, "DL_MUMBLE_LINK_IDENTITY") == 0)
+		return &state.mumble_identity;
 	if (strcmp(identifier, "DL_NEXUS_LINK") == 0)
 		return &state.nexus_link_data;
 
