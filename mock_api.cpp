@@ -543,10 +543,20 @@ Texture* mock_textures_get(const char* id) { return mock_textures_get_internal(i
 // Forward declaration (defined with the other load_from_* functions below)
 static void mock_textures_load_from_resource(const char* id, unsigned resource_id, HMODULE module, TEXTURES_RECEIVECALLBACK callback);
 
+// the first call requests the texture, later calls only look it up
+static bool first_texture_request(const char* id)
+{
+	auto& state = get_mock_state();
+	std::lock_guard<std::mutex> lock(state.requested_textures_mutex);
+	return state.requested_textures.insert(id).second;
+}
+
 static Texture* mock_textures_get_or_create_file(const char* id, const char* filename)
 {
 	if (auto* existing = mock_textures_get_internal(id))
 		return existing;
+	if (!first_texture_request(id))
+		return nullptr;
 	queue_texture_upload_from_file(id, filename ? filename : "", nullptr);
 	return nullptr;
 }
@@ -555,6 +565,8 @@ static Texture* mock_textures_get_or_create_resource(const char* id, unsigned re
 {
 	if (auto* existing = mock_textures_get_internal(id))
 		return existing;
+	if (!first_texture_request(id))
+		return nullptr;
 	mock_textures_load_from_resource(id, resource_id, module, nullptr);
 	return nullptr;
 }
@@ -563,6 +575,8 @@ static Texture* mock_textures_get_or_create_url(const char* id, const char* remo
 {
 	if (auto* existing = mock_textures_get_internal(id))
 		return existing;
+	if (!first_texture_request(id))
+		return nullptr;
 
 	std::string sid = id, url = build_url(remote ? remote : "", endpoint ? endpoint : "");
 	std::thread([sid, url]() {
@@ -580,6 +594,8 @@ static Texture* mock_textures_get_or_create_memory(const char* id, void* data, s
 {
 	if (auto* existing = mock_textures_get_internal(id))
 		return existing;
+	if (!first_texture_request(id))
+		return nullptr;
 
 	PendingTextureUpload upload;
 	upload.id = id;

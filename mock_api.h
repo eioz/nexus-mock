@@ -7,6 +7,7 @@
 #include <d3d11.h>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -64,6 +65,10 @@ struct MockState
 
 	std::vector<PendingTextureUpload> pending_uploads;
 	std::mutex pending_uploads_mutex;
+
+	// textures that were requested once, so per-frame GetOrCreate calls do not repeat downloads
+	std::set<std::string> requested_textures;
+	std::mutex requested_textures_mutex;
 
 	std::map<std::string, std::vector<uint8_t>> shared_blocks;
 
