@@ -9,7 +9,6 @@
 #include <cstdio>
 #include <d3d11.h>
 #include <filesystem>
-#include <fstream>
 
 // Forward declarations
 static bool CreateDeviceD3D(HWND hwnd);
@@ -404,25 +403,6 @@ int main(int argc, char* argv[])
 
 	// Create data directory next to executable
 	std::filesystem::create_directories("data");
-
-	// Prepare arcdps directories for monitor startup.
-	{
-		auto arcdps_path = std::filesystem::absolute("data/arcdps");
-		std::filesystem::create_directories(arcdps_path);
-		std::filesystem::create_directories(arcdps_path / "arcdps.cbtlogs");
-
-		auto ini_path = arcdps_path / "arcdps.ini";
-		if (!std::filesystem::exists(ini_path))
-		{
-			auto path_str = arcdps_path.string();
-			std::string ini_content = "[session]\nboss_encounter_path=" + path_str + "\n\n[main]\nboss_encounter_path=" + path_str + "\n";
-			if (std::ofstream f(ini_path); f.is_open())
-				f << ini_content;
-		}
-
-		auto log_directory = (arcdps_path / "arcdps.cbtlogs").string();
-		printf("[MOCK] Log directory: %s\n", log_directory.c_str());
-	}
 
 	// Create window
 	WNDCLASSEX wc = { sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"NexusMock", nullptr };
