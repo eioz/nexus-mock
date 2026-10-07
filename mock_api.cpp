@@ -603,7 +603,7 @@ static void mock_textures_load_from_file(const char* id, const char* filename, T
 
 static void mock_textures_load_from_resource(const char* id, unsigned resource_id, HMODULE module, TEXTURES_RECEIVECALLBACK callback)
 {
-	HRSRC hres = FindResourceA(module, MAKEINTRESOURCEA(resource_id), (LPCSTR)RT_RCDATA);
+	HRSRC hres = FindResourceA(module, MAKEINTRESOURCEA(resource_id), "PNG");
 	if (!hres)
 	{
 		printf("[MOCK] LoadFromResource: FindResource failed for id=%u (error %lu)\n", resource_id, GetLastError());
