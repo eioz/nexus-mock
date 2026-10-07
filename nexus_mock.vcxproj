@@ -97,6 +97,7 @@
   <ItemGroup>
     <ClInclude Include="mock_api.h" />
     <ClInclude Include="stb_image.h" />
+    <ClInclude Include="test_scenario.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

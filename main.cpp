@@ -1,4 +1,5 @@
 #include "mock_api.h"
+#include "test_scenario.h"
 
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
@@ -9,6 +10,8 @@
 #include <cstdio>
 #include <d3d11.h>
 #include <filesystem>
+#include <string>
+#include <vector>
 
 // Forward declarations
 static bool CreateDeviceD3D(HWND hwnd);
@@ -131,6 +134,98 @@ static void CleanupDeviceD3D()
 	{
 		g_device->Release();
 		g_device = nullptr;
+	}
+}
+
+struct LaunchOptions
+{
+	const char* dll_path = nullptr;
+	bool hide_mock_controls = false;
+	std::string test_script;
+	std::string font_file;
+	std::string heading_font_file;
+	std::vector<std::string> keybinds_to_invoke;
+};
+
+static void print_usage()
+{
+	printf("Usage: nexus_mock.exe <path-to-addon.dll> [options]\n");
+	printf("Options:\n");
+	printf("  --test-script <path>      Replay timed inputs, capture BMP frames, and exit.\n");
+	printf("  --invoke-keybind <id>     Invoke a registered Nexus keybind after addon load.\n");
+	printf("  --hide-controls           Hide the mock control panel for clean screenshots.\n");
+	printf("  --font-file <path>        Load a TTF body font at 15 pixels.\n");
+	printf("  --heading-font-file <path> Load a separate TTF heading font at 24 pixels.\n");
+}
+
+static bool parse_launch_options(int argc, char* argv[], LaunchOptions& options)
+{
+	for (int i = 1; i < argc; ++i)
+	{
+		std::string arg = argv[i];
+		if (arg == "--invoke-keybind")
+		{
+			if (i + 1 >= argc)
+			{
+				printf("[MOCK] ERROR: --invoke-keybind requires an id.\n");
+				return false;
+			}
+			options.keybinds_to_invoke.emplace_back(argv[++i]);
+		}
+		else if (arg == "--test-script")
+		{
+			if (i + 1 >= argc) return false;
+			options.test_script = argv[++i];
+		}
+		else if (arg == "--hide-controls")
+		{
+			options.hide_mock_controls = true;
+		}
+		else if (arg == "--font-file" || arg == "--heading-font-file")
+		{
+			if (i + 1 >= argc)
+			{
+				printf("[MOCK] ERROR: %s requires a font file.\n", arg.c_str());
+				return false;
+			}
+			(arg == "--font-file" ? options.font_file : options.heading_font_file) = argv[++i];
+		}
+		else if (arg == "--help" || arg == "-h" || arg == "/?")
+		{
+			return false;
+		}
+		else if (arg.rfind("--", 0) == 0)
+		{
+			printf("[MOCK] ERROR: Unknown option: %s\n", arg.c_str());
+			return false;
+		}
+		else if (options.dll_path == nullptr)
+		{
+			options.dll_path = argv[i];
+		}
+		else
+		{
+			printf("[MOCK] ERROR: Unexpected argument: %s\n", arg.c_str());
+			return false;
+		}
+	}
+
+	if (options.dll_path == nullptr)
+	{
+		printf("[MOCK] ERROR: Missing addon DLL path.\n");
+		return false;
+	}
+
+	return true;
+}
+
+static void invoke_startup_keybinds(const std::vector<std::string>& keybinds)
+{
+	for (const auto& keybind : keybinds)
+	{
+		printf("[MOCK] Invoking keybind: %s\n", keybind.c_str());
+		invoke_keybind(keybind.c_str(), false);
+		invoke_keybind(keybind.c_str(), true);
 	}
 }
 
@@ -385,23 +480,34 @@ static void render_mock_controls()
 
 int main(int argc, char* argv[])
 {
-	if (argc < 2)
+	LaunchOptions launch_options;
+	if (!parse_launch_options(argc, argv, launch_options))
 	{
-		printf("Usage: nexus_mock.exe <path-to-addon.dll>\n");
+		print_usage();
 		return 1;
 	}
 
-	const char* dll_path = argv[1];
+	const char* dll_path = launch_options.dll_path;
 
 	if (!std::filesystem::exists(dll_path))
 	{
 		printf("[MOCK] ERROR: File not found: %s\n", dll_path);
 		return 1;
 	}
+	for (const auto& font_file : { launch_options.font_file, launch_options.heading_font_file })
+	{
+		if (font_file.empty()) continue;
+		std::error_code error;
+		if (!std::filesystem::is_regular_file(font_file, error))
+		{
+			printf("[MOCK] ERROR: Font file not found: %s\n", font_file.c_str());
+			return 1;
+		}
+	}
 
 	printf("[MOCK] Starting Nexus Mock...\n");
 
-	// Create data directory next to executable
+	// Create data directory in the working directory
 	std::filesystem::create_directories("data");
 
 	// Create window
@@ -448,13 +554,28 @@ int main(int argc, char* argv[])
 	state.nexus_link_data.Scaling = 1.0f;
 	state.nexus_link_data.IsGameplay = true;
 
-	// Populate font pointers from ImGui defaults (build atlas first)
-	io.Fonts->AddFontDefault();
-	io.Fonts->Build();
-	ImFont* default_font = io.Fonts->Fonts.Size > 0 ? io.Fonts->Fonts[0] : nullptr;
-	state.nexus_link_data.Font = default_font;
-	state.nexus_link_data.FontBig = default_font;
-	state.nexus_link_data.FontUI = default_font;
+	// Keep the default body stable for scripted tests; optional fonts match Nexus's native sizes.
+	ImFont* body_font = launch_options.font_file.empty() ? io.Fonts->AddFontDefault() : io.Fonts->AddFontFromFileTTF(launch_options.font_file.c_str(), 15.f);
+	const auto& heading_font_file = launch_options.heading_font_file.empty() ? launch_options.font_file : launch_options.heading_font_file;
+	ImFontConfig heading_config;
+	heading_config.SizePixels = 24.f;
+	ImFont* heading_font = heading_font_file.empty() ? io.Fonts->AddFontDefault(&heading_config) : io.Fonts->AddFontFromFileTTF(heading_font_file.c_str(), 24.f);
+	if (!body_font || !heading_font || !io.Fonts->Build())
+	{
+		printf("[MOCK] ERROR: Could not build the font atlas.\n");
+		ImGui_ImplDX11_Shutdown();
+		ImGui_ImplWin32_Shutdown();
+		ImGui::DestroyContext();
+		CleanupDeviceD3D();
+		DestroyWindow(hwnd);
+		UnregisterClass(wc.lpszClassName, wc.hInstance);
+		return 1;
+	}
+	io.FontDefault = body_font;
+	state.nexus_link_data.Font = body_font;
+	state.nexus_link_data.FontBig = heading_font;
+	state.nexus_link_data.FontUI = body_font;
+	printf("[MOCK] Fonts: body %.0f px (%s), heading %.0f px (%s)\n", body_font->FontSize, launch_options.font_file.empty() ? "default" : launch_options.font_file.c_str(), heading_font->FontSize, heading_font_file.empty() ? "default" : heading_font_file.c_str());
 
 	// Create mock API and inject D3D11/ImGui context
 	set_mock_device(g_device);
@@ -483,7 +604,16 @@ int main(int argc, char* argv[])
 
 	printf("[MOCK] Initializing addon...\n");
 	addon.definition->Load(mock_api);
+	invoke_startup_keybinds(launch_options.keybinds_to_invoke);
 	printf("[MOCK] Addon initialized. Starting render loop.\n");
+
+	TestScenario scenario;
+	if (!scenario.load(launch_options.test_script))
+	{
+		printf("[MOCK] Invalid test script.\n");
+		scenario.failed = true;
+		PostQuitMessage(1);
+	}
 
 	// Render loop
 	const float clear_color[4] = { 0.1f, 0.1f, 0.1f, 1.0f };
@@ -504,7 +634,9 @@ int main(int argc, char* argv[])
 
 		ImGui_ImplDX11_NewFrame();
 		ImGui_ImplWin32_NewFrame();
+		scenario.before_frame(mock_api->Textures.GetOrCreateFromFile);
 		ImGui::NewFrame();
+		scenario.begin_frame();
 
 		flush_pending_texture_uploads();
 
@@ -515,7 +647,8 @@ int main(int argc, char* argv[])
 		for (auto& cb : pre_cbs)
 			cb();
 
-		render_mock_controls();
+		if (!launch_options.hide_mock_controls)
+			render_mock_controls();
 
 		for (auto& cb : render_cbs)
 			cb();
@@ -535,6 +668,8 @@ int main(int argc, char* argv[])
 			ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 		}
 
+		if (scenario.after_frame(g_device, g_context, g_swap_chain, state.textures))
+			PostQuitMessage(scenario.failed ? 1 : 0);
 		g_swap_chain->Present(1, 0);
 	}
 
@@ -552,5 +687,5 @@ int main(int argc, char* argv[])
 	DestroyWindow(hwnd);
 	UnregisterClass(wc.lpszClassName, wc.hInstance);
 
-	return 0;
+	return scenario.failed ? 1 : 0;
 }
