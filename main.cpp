@@ -5,12 +5,14 @@
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 
-#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <d3d11.h>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // Forward declarations
@@ -46,35 +48,41 @@ static void CleanupRenderTarget()
 
 static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-	// Forward to registered addon WndProc callbacks before ImGui or game processing
-	{
-		auto cbs = get_mock_state().wndproc_callbacks;
-		for (auto& cb : cbs)
-			if (cb(hWnd, msg, wParam, lParam) == 0)
-				return 0;
-	}
-
-	// Process keybinds before ImGui consumes keyboard messages
-	process_keybind_message(msg, wParam, lParam);
-
-	if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
-		return true;
+	if (process_window_message(hWnd, msg, wParam, lParam))
+		return 0;
 
 	switch (msg)
 	{
+	case WM_SETCURSOR:
+		// ImGui sets its cursor shapes over its windows
+		if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+			return TRUE;
+		break;
 	case WM_SIZE:
 		if (g_device && wParam != SIZE_MINIMIZED)
 		{
+			// like Nexus in its ResizeBuffers hook, the link gets the size and the event fires before the buffers change
+			update_nexus_link(LOWORD(lParam), HIWORD(lParam));
+			raise_event(EV_WINDOW_RESIZED, nullptr);
 			CleanupRenderTarget();
 			g_swap_chain->ResizeBuffers(0, LOWORD(lParam), HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0);
 			CreateRenderTarget();
 		}
 		return 0;
+	case WM_GETMINMAXINFO:
+		// lets the size presets exceed the screen
+		reinterpret_cast<MINMAXINFO*>(lParam)->ptMaxTrackSize = { 16384, 16384 };
+		return 0;
+	case WM_SYSCOMMAND:
+		// Alt alone would open the window menu, which stalls the render loop
+		if ((wParam & 0xfff0) == SC_KEYMENU)
+			return 0;
+		break;
 	case WM_DESTROY:
 		PostQuitMessage(0);
 		return 0;
 	}
-	return DefWindowProc(hWnd, msg, wParam, lParam);
+	return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
 static bool CreateDeviceD3D(HWND hwnd)
@@ -99,7 +107,7 @@ static bool CreateDeviceD3D(HWND hwnd)
 	D3D_FEATURE_LEVEL feature_level;
 	HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, nullptr, 0, D3D11_SDK_VERSION, &sd, &g_swap_chain, &g_device, &feature_level, &g_context);
 
-	// Debug layer may not be installed — retry without it
+	// The debug layer may not be installed, so retry without it
 	if (FAILED(hr) && (flags & D3D11_CREATE_DEVICE_DEBUG))
 	{
 		flags &= ~D3D11_CREATE_DEVICE_DEBUG;
@@ -137,625 +145,594 @@ static void CleanupDeviceD3D()
 	}
 }
 
+static bool resize_client_area(HWND hwnd, int width, int height)
+{
+	RECT rect{ 0, 0, width, height };
+	const DWORD style = static_cast<DWORD>(GetWindowLongPtr(hwnd, GWL_STYLE));
+	const DWORD extended_style = static_cast<DWORD>(GetWindowLongPtr(hwnd, GWL_EXSTYLE));
+	if (!AdjustWindowRectEx(&rect, style, GetMenu(hwnd) != nullptr, extended_style))
+		return false;
+	if (IsIconic(hwnd) || IsZoomed(hwnd))
+		ShowWindow(hwnd, SW_RESTORE);
+	return SetWindowPos(hwnd, nullptr, 0, 0, rect.right - rect.left, rect.bottom - rect.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) != FALSE;
+}
+
+// --- Launch options ---
+
 struct LaunchOptions
 {
-	const char* dll_path = nullptr;
-	bool hide_mock_controls = false;
+	std::filesystem::path addon;
+	bool hide_controls = false;
 	std::string test_script;
 	std::string font_file;
 	std::string heading_font_file;
-	std::vector<std::string> keybinds_to_invoke;
+	std::vector<std::string> input_binds;
 };
 
 static void print_usage()
 {
 	printf("Usage: nexus_mock.exe <path-to-addon.dll> [options]\n");
 	printf("Options:\n");
-	printf("  --test-script <path>      Replay timed inputs, capture BMP frames, and exit.\n");
-	printf("  --invoke-keybind <id>     Invoke a registered Nexus keybind after addon load.\n");
-	printf("  --hide-controls           Hide the mock control panel for clean screenshots.\n");
-	printf("  --font-file <path>        Load a TTF body font at 15 pixels.\n");
-	printf("  --heading-font-file <path> Load a separate TTF heading font at 24 pixels.\n");
+	printf("  --invoke-keybind <id>      Press and release an input bind of the addon after it loaded.\n");
+	printf("  --hide-controls            Hide the mock controls for clean screenshots.\n");
+	printf("  --font-file <path>         Use a TTF or OTF font for the body text.\n");
+	printf("  --heading-font-file <path> Use a TTF or OTF font for the Nexus link fonts.\n");
+	printf("  --test-script <path>       Replay timed input, capture frames, and exit after the last event.\n");
 }
 
 static bool parse_launch_options(int argc, char* argv[], LaunchOptions& options)
 {
 	for (int i = 1; i < argc; ++i)
 	{
-		std::string arg = argv[i];
+		const std::string_view arg = argv[i];
+		std::string* value = nullptr;
 		if (arg == "--invoke-keybind")
-		{
-			if (i + 1 >= argc)
-			{
-				printf("[MOCK] ERROR: --invoke-keybind requires an id.\n");
-				return false;
-			}
-			options.keybinds_to_invoke.emplace_back(argv[++i]);
-		}
+			value = &options.input_binds.emplace_back();
 		else if (arg == "--test-script")
-		{
-			if (i + 1 >= argc) return false;
-			options.test_script = argv[++i];
-		}
+			value = &options.test_script;
+		else if (arg == "--font-file")
+			value = &options.font_file;
+		else if (arg == "--heading-font-file")
+			value = &options.heading_font_file;
 		else if (arg == "--hide-controls")
-		{
-			options.hide_mock_controls = true;
-		}
-		else if (arg == "--font-file" || arg == "--heading-font-file")
-		{
-			if (i + 1 >= argc)
-			{
-				printf("[MOCK] ERROR: %s requires a font file.\n", arg.c_str());
-				return false;
-			}
-			(arg == "--font-file" ? options.font_file : options.heading_font_file) = argv[++i];
-		}
+			options.hide_controls = true;
 		else if (arg == "--help" || arg == "-h" || arg == "/?")
+			return false;
+		else if (arg.starts_with("--"))
 		{
+			printf("[MOCK] ERROR: Unknown option: %s\n", argv[i]);
 			return false;
 		}
-		else if (arg.rfind("--", 0) == 0)
-		{
-			printf("[MOCK] ERROR: Unknown option: %s\n", arg.c_str());
-			return false;
-		}
-		else if (options.dll_path == nullptr)
-		{
-			options.dll_path = argv[i];
-		}
+		else if (options.addon.empty())
+			options.addon = argv[i];
 		else
 		{
-			printf("[MOCK] ERROR: Unexpected argument: %s\n", arg.c_str());
+			printf("[MOCK] ERROR: Unexpected argument: %s\n", argv[i]);
 			return false;
+		}
+
+		if (value)
+		{
+			if (++i == argc)
+			{
+				printf("[MOCK] ERROR: %s needs a value.\n", argv[i - 1]);
+				return false;
+			}
+			*value = argv[i];
 		}
 	}
 
-	if (options.dll_path == nullptr)
+	if (options.addon.empty())
 	{
 		printf("[MOCK] ERROR: Missing addon DLL path.\n");
 		return false;
 	}
-
 	return true;
 }
 
-static void invoke_startup_keybinds(const std::vector<std::string>& keybinds)
+// --- Addon ---
+
+struct Addon
 {
-	for (const auto& keybind : keybinds)
-	{
-		printf("[MOCK] Invoking keybind: %s\n", keybind.c_str());
-		invoke_keybind(keybind.c_str(), false);
-		invoke_keybind(keybind.c_str(), true);
-	}
-}
-
-// --- DLL loading ---
-
-using GetAddonDefFn = AddonDefinition* (*)();
-
-struct LoadedAddon
-{
-	HMODULE handle = nullptr;
-	AddonDefinition* definition = nullptr;
+	HMODULE module = nullptr;
+	AddonDefinition_t* definition = nullptr;
 };
 
-static LoadedAddon load_addon_dll(const char* path)
+static Addon load_addon(const std::filesystem::path& path)
 {
-	LoadedAddon addon;
-
-	addon.handle = LoadLibraryA(path);
-	if (!addon.handle)
+	Addon addon;
+	addon.module = LoadLibraryW(path.c_str());
+	if (!addon.module)
 	{
-		printf("[MOCK] ERROR: Failed to load DLL: %s (error %lu)\n", path, GetLastError());
-		return addon;
+		printf("[MOCK] ERROR: Cannot load %s (error %lu).\n", path.string().c_str(), GetLastError());
+		return {};
 	}
 
-	auto get_def = reinterpret_cast<GetAddonDefFn>(GetProcAddress(addon.handle, "GetAddonDef"));
-	if (!get_def)
+	auto get_definition = reinterpret_cast<AddonDefinition_t* (*)()>(GetProcAddress(addon.module, "GetAddonDef"));
+	addon.definition = get_definition ? get_definition() : nullptr;
+	const auto* definition = addon.definition;
+	if (!definition)
+		printf("[MOCK] ERROR: %s exports no GetAddonDef.\n", path.string().c_str());
+	// the minimum requirements Nexus checks
+	else if (!definition->Signature || !definition->Name || !definition->Author || !definition->Description || !definition->Load || (!(definition->Flags & AF_DisableHotloading) && !definition->Unload))
+		printf("[MOCK] ERROR: The addon definition needs a signature, a name, an author, a description, Load, and Unload unless hotloading is disabled.\n");
+	else if (definition->APIVersion != NEXUS_API_VERSION)
+		printf("[MOCK] ERROR: The addon uses API version %u, the mock implements %d.\n", definition->APIVersion, NEXUS_API_VERSION);
+	else
 	{
-		printf("[MOCK] ERROR: DLL does not export GetAddonDef: %s\n", path);
-		FreeLibrary(addon.handle);
-		addon.handle = nullptr;
+		const auto& version = definition->Version;
+		printf("[MOCK] Loaded addon: %s v%d.%d.%d.%d by %s\n", definition->Name, version.Major, version.Minor, version.Build, version.Revision, definition->Author);
 		return addon;
 	}
-
-	addon.definition = get_def();
-	if (!addon.definition)
-	{
-		printf("[MOCK] ERROR: GetAddonDef returned null: %s\n", path);
-		FreeLibrary(addon.handle);
-		addon.handle = nullptr;
-		return addon;
-	}
-
-	printf("[MOCK] Loaded addon: %s v%d.%d.%d.%d by %s (API v%u)\n", addon.definition->Name, addon.definition->Version.Major, addon.definition->Version.Minor, addon.definition->Version.Build, addon.definition->Version.Revision, addon.definition->Author, addon.definition->APIVersion);
-
-	if (addon.definition->APIVersion != NEXUS_API_VERSION)
-	{
-		printf("[MOCK] ERROR: Addon API version %u does not match mock API version %u\n", addon.definition->APIVersion, NEXUS_API_VERSION);
-		FreeLibrary(addon.handle);
-		addon.handle = nullptr;
-		addon.definition = nullptr;
-		return addon;
-	}
-
-	return addon;
+	FreeLibrary(addon.module);
+	return {};
 }
 
-// --- Quick Access bar ---
+// --- Nexus UI ---
 
-static void render_quick_access()
+// callbacks run on a copy, so they can register and deregister
+static std::vector<GUI_RENDER> callbacks(std::vector<GUI_RENDER> MockState::* list)
 {
-	auto quick_access = get_mock_state().quick_access;
-	if (quick_access.empty())
+	auto& state = get_mock_state();
+	std::lock_guard lock(state.mutex);
+	return state.*list;
+}
+
+// Nexus shows one alert at a time for five seconds, then fades it out over two and a half
+static void render_alerts()
+{
+	auto& state = get_mock_state();
+	std::string message;
+	float alpha = 1.f;
+	{
+		std::lock_guard lock(state.mutex);
+		const auto now = std::chrono::steady_clock::now();
+		while (!state.alerts.empty())
+		{
+			auto& alert = state.alerts.front();
+			if (alert.shown == std::chrono::steady_clock::time_point{})
+				alert.shown = now;
+			const float age = std::chrono::duration<float>(now - alert.shown).count();
+			if (age < 7.5f)
+			{
+				message = alert.message;
+				alpha = age < 5.f ? 1.f : 1.f - std::pow((age - 5.f) / 2.5f, 3.f);
+				break;
+			}
+			state.alerts.erase(state.alerts.begin());
+		}
+	}
+	if (message.empty())
 		return;
 
-	ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_Always);
-	ImGui::SetNextWindowBgAlpha(0.75f);
-	constexpr auto flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_AlwaysAutoResize;
+	const auto& link = state.nexus_link;
+	ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, 230.f * link.Scaling), ImGuiCond_Always, ImVec2(0.5f, 0.f));
+	constexpr auto flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+	if (ImGui::Begin("##Alerts", nullptr, flags))
+	{
+		if (link.FontBig)
+			ImGui::PushFont(static_cast<ImFont*>(link.FontBig));
+		// yellow text with a black outline
+		const auto position = ImGui::GetCursorScreenPos();
+		const auto outline = ImGui::GetColorU32(ImVec4(0.f, 0.f, 0.f, alpha));
+		for (const auto& offset : { ImVec2(-1.f, 0.f), ImVec2(1.f, 0.f), ImVec2(0.f, -1.f), ImVec2(0.f, 1.f) })
+			ImGui::GetWindowDrawList()->AddText(ImVec2(position.x + offset.x, position.y + offset.y), outline, message.c_str());
+		ImGui::TextColored(ImVec4(1.f, 1.f, 0.f, alpha), "%s", message.c_str());
+		if (link.FontBig)
+			ImGui::PopFont();
+	}
+	ImGui::End();
+}
 
+// Nexus shows the first options callback of an addon in its "Nexus" window
+static void render_nexus_window(bool& open, const char* addon_name)
+{
+	if (!open)
+		return;
+	const auto options = callbacks(&MockState::options_render);
+	const auto& io = ImGui::GetIO();
+	ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+	ImGui::SetNextWindowSize(ImVec2(620.f, 460.f), ImGuiCond_FirstUseEver);
+	if (ImGui::Begin("Nexus", &open))
+	{
+		ImGui::TextUnformatted(addon_name);
+		if (options.empty())
+			ImGui::TextDisabled("No options");
+		else if (ImGui::CollapsingHeader("Options", ImGuiTreeNodeFlags_DefaultOpen))
+			options.front()();
+	}
+	ImGui::End();
+}
+
+// Nexus sorts the shortcuts by identifier, and shows one with context menu items or an input bind with a handler
+static void render_quick_access()
+{
+	auto& state = get_mock_state();
+	std::vector<std::pair<std::string, MockShortcut>> shortcuts;
+	std::map<std::string, std::string> binds; // the handled input binds, as text
+	{
+		std::lock_guard lock(state.mutex);
+		for (const auto& bind : state.input_binds)
+			if (bind.handler)
+				binds[bind.id] = bind.bind.code ? bind_text(bind.bind) : "";
+		for (const auto& [id, shortcut] : state.shortcuts)
+			if (!shortcut.context_menu.empty() || binds.contains(shortcut.input_bind))
+				shortcuts.emplace_back(id, shortcut);
+	}
+	if (shortcuts.empty())
+		return;
+
+	static std::string hovered; // the hover texture shows from the next frame on
+	std::string hovered_now;
+	ImGui::SetNextWindowPos(ImVec2(10.f, 10.f), ImGuiCond_Always);
+	constexpr auto flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing;
 	if (ImGui::Begin("##QuickAccess", nullptr, flags))
 	{
-		constexpr float icon_size = 32.0f;
-
-		for (auto& entry : quick_access)
+		for (const auto& [id, shortcut] : shortcuts)
 		{
-			Texture* tex = mock_textures_get(entry.texture_id.c_str());
-
+			ImGui::PushID(id.c_str());
+			const ImVec2 size(32.f, 32.f);
 			bool clicked = false;
-			if (tex && tex->Resource)
+			if (const auto* texture = get_texture(hovered == id ? shortcut.hover_texture : shortcut.texture))
 			{
-				ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
-				ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1, 1, 1, 0.15f));
-				ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1, 1, 1, 0.25f));
-				clicked = ImGui::ImageButton((ImTextureID)tex->Resource, ImVec2(icon_size, icon_size));
+				ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.f, 0.f, 0.f, 0.f));
+				ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.f, 1.f, 1.f, 0.15f));
+				ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.f, 1.f, 1.f, 0.25f));
+				clicked = ImGui::ImageButton(texture->Resource, size, ImVec2(0.f, 0.f), ImVec2(1.f, 1.f), 0);
 				ImGui::PopStyleColor(3);
 			}
 			else
 			{
-				// Placeholder: colored square with first letter of tooltip
-				char label[4] = { '?', '\0' };
-				if (!entry.tooltip.empty())
-					label[0] = entry.tooltip[0];
-
-				ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.35f, 0.5f, 1.0f));
-				ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.5f, 0.7f, 1.0f));
-				clicked = ImGui::Button(label, ImVec2(icon_size, icon_size));
+				// the tooltip's first letter stands in for a missing texture
+				const char label[] = { shortcut.tooltip.empty() ? '?' : shortcut.tooltip[0], '\0' };
+				ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.35f, 0.5f, 1.f));
+				ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.5f, 0.7f, 1.f));
+				clicked = ImGui::Button(label, size);
 				ImGui::PopStyleColor(2);
 			}
-
-			if (clicked && !entry.keybind_id.empty())
+			if (ImGui::IsItemHovered())
 			{
-				invoke_keybind(entry.keybind_id.c_str(), false);
-				invoke_keybind(entry.keybind_id.c_str(), true);
+				hovered_now = id;
+				const auto bind = binds.find(shortcut.input_bind);
+				const auto tooltip = shortcut.tooltip + (bind != binds.end() && !bind->second.empty() ? " (" + bind->second + ")" : "");
+				if (!shortcut.tooltip.empty())
+					ImGui::SetTooltip("%s", tooltip.c_str());
 			}
+			if (shortcut.notified)
+				ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(ImGui::GetItemRectMax().x - 5.f, ImGui::GetItemRectMin().y + 5.f), 4.f, IM_COL32(255, 200, 0, 255));
 
-			if (!entry.context_menus.empty())
+			// a click clears the notification and invokes only the press
+			if (clicked && !shortcut.input_bind.empty())
 			{
-				auto popup_id = "##ctx_" + entry.id;
-				if (ImGui::BeginPopupContextItem(popup_id.c_str()))
 				{
-					for (auto& [menu_id, cb] : entry.context_menus)
-						cb();
-					ImGui::EndPopup();
+					std::lock_guard lock(state.mutex);
+					if (const auto found = state.shortcuts.find(id); found != state.shortcuts.end())
+						found->second.notified = false;
 				}
+				invoke_input_bind(shortcut.input_bind, false);
 			}
 
-			if (ImGui::IsItemHovered() && !entry.tooltip.empty())
-				ImGui::SetTooltip("%s", entry.tooltip.c_str());
-
-			ImGui::SameLine(0.0f, 4.0f);
+			if (!shortcut.context_menu.empty() && ImGui::BeginPopupContextItem("ShortcutsCtxMenu"))
+			{
+				bool first = true;
+				for (const auto& [item, callback] : shortcut.context_menu)
+				{
+					if (!callback)
+						continue;
+					if (!first)
+						ImGui::Separator();
+					first = false;
+					callback();
+				}
+				ImGui::EndPopup();
+			}
+			ImGui::PopID();
+			ImGui::SameLine(0.f, 4.f);
 		}
 	}
 	ImGui::End();
+	hovered = hovered_now;
 }
 
-// --- Alert overlay ---
+// --- Mock controls ---
 
-static void render_alerts()
+// A resize sends WM_SIZE right away, so the size is applied after the frame.
+static void render_mock_controls(SIZE& requested_size)
 {
 	auto& state = get_mock_state();
-	auto now = std::chrono::steady_clock::now();
-	constexpr float display_seconds = 3.0f;
-
-	std::lock_guard<std::mutex> lock(state.alerts_mutex);
-	state.alerts.erase(std::remove_if(state.alerts.begin(), state.alerts.end(), [&](const MockAlert& a) { return std::chrono::duration<float>(now - a.created).count() > display_seconds; }), state.alerts.end());
-
-	if (state.alerts.empty())
-		return;
-
-	const auto& latest = state.alerts.back();
-	float age = std::chrono::duration<float>(now - latest.created).count();
-	float alpha = 1.0f - (age / display_seconds);
-
-	ImGuiIO& io = ImGui::GetIO();
-	ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.15f);
-	ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-	ImGui::SetNextWindowBgAlpha(alpha * 0.85f);
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16, 8));
-
-	constexpr auto flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs;
-
-	if (ImGui::Begin("##Alert", nullptr, flags))
+	std::vector<std::pair<std::string, std::string>> binds;
+	std::vector<std::pair<std::string, size_t>> events;
+	std::vector<std::pair<std::string, bool>> windows;
+	size_t render_counts[4] = {};
 	{
-		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, alpha));
-		ImGui::Text("%s", latest.message.c_str());
-		ImGui::PopStyleColor();
+		std::lock_guard lock(state.mutex);
+		for (const auto& bind : state.input_binds)
+			if (bind.handler)
+				binds.emplace_back(bind.id, bind_text(bind.bind));
+		for (const auto& [id, subscriptions] : state.events)
+			events.emplace_back(id, subscriptions.size());
+		for (const auto& [name, visible] : state.close_on_escape)
+			windows.emplace_back(name, *visible);
+		size_t i = 0;
+		for (const auto* list : { &state.pre_render, &state.render, &state.post_render, &state.options_render })
+			render_counts[i++] = list->size();
 	}
-	ImGui::End();
-	ImGui::PopStyleVar();
-}
 
-// --- Mock control panel ---
-
-static bool resize_client_area(HWND hwnd, int width, int height)
-{
-	RECT rect{ 0, 0, width, height };
-	const DWORD style = static_cast<DWORD>(GetWindowLongPtr(hwnd, GWL_STYLE));
-	const DWORD extended_style = static_cast<DWORD>(GetWindowLongPtr(hwnd, GWL_EXSTYLE));
-	if (!AdjustWindowRectEx(
-			&rect,
-			style,
-			GetMenu(hwnd) != nullptr,
-			extended_style))
-	{
-		return false;
-	}
-	if (IsIconic(hwnd) || IsZoomed(hwnd))
-		ShowWindow(hwnd, SW_RESTORE);
-	return SetWindowPos(
-		hwnd,
-		nullptr,
-		0,
-		0,
-		rect.right - rect.left,
-		rect.bottom - rect.top,
-		SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) != FALSE;
-}
-
-// a character standing at the origin, with the camera behind and above it
-static void populate_mumble(MockState& state)
-{
-	auto& mumble = state.mumble_data;
-	mumble.UIVersion = 2;
-	mumble.UITick = 1;
-	wcscpy_s(mumble.Name, L"Guild Wars 2");
-	mumble.AvatarFront = { 0.f, 0.f, 1.f };
-	mumble.CameraPosition = { 0.f, 3.f, -8.f };
-	mumble.CameraFront = { 0.f, -0.2425f, 0.9701f };
-	wcscpy_s(mumble.Identity, LR"({"name":"Mock Character","profession":1,"spec":62,"race":2,"map_id":50,"world_id":0,"team_color_id":0,"commander":false,"fov":1.222,"uisz":1})");
-	mumble.ContextLength = 48;
-	mumble.Context.MapID = 50;
-	mumble.Context.MapType = Mumble::EMapType::Public;
-	mumble.Context.ShardID = 1;
-	mumble.Context.InstanceID = 1;
-	mumble.Context.IsGameFocused = 1;
-	mumble.Context.ProcessID = GetCurrentProcessId();
-
-	auto& identity = state.mumble_identity;
-	strcpy_s(identity.Name, "Mock Character");
-	identity.Profession = Mumble::EProfession::Guardian;
-	identity.Specialization = 62;
-	identity.Race = Mumble::ERace::Human;
-	identity.MapID = 50;
-	identity.FOV = 1.222f;
-	identity.UISize = Mumble::EUIScale::Normal;
-}
-
-static void render_mock_controls(HWND hwnd)
-{
-	auto& state = get_mock_state();
-
-	ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-	ImGui::SetNextWindowSize(ImVec2(320, 420), ImGuiCond_FirstUseEver);
+	// back to the top right after a resize, so the size presets stay in reach
+	static float display_width = 0.f;
+	const float width = ImGui::GetIO().DisplaySize.x;
+	ImGui::SetNextWindowPos(ImVec2(width - 350.f, 10.f), display_width == 0.f || display_width == width ? ImGuiCond_FirstUseEver : ImGuiCond_Always);
+	display_width = width;
+	ImGui::SetNextWindowSize(ImVec2(340.f, 470.f), ImGuiCond_FirstUseEver);
 	if (ImGui::Begin("Mock Controls"))
 	{
-		ImGui::Text("Mumble Link");
+		ImGui::TextUnformatted("Mumble Link");
 		ImGui::Separator();
-
-		bool in_combat = state.mumble_data.Context.IsInCombat;
+		auto& context = state.mumble.Context;
+		bool in_combat = context.IsInCombat;
 		if (ImGui::Checkbox("In Combat", &in_combat))
-			state.mumble_data.Context.IsInCombat = in_combat ? 1 : 0;
-
-		bool map_open = state.mumble_data.Context.IsMapOpen;
+			context.IsInCombat = in_combat;
+		bool map_open = context.IsMapOpen;
 		if (ImGui::Checkbox("Map Open", &map_open))
-			state.mumble_data.Context.IsMapOpen = map_open ? 1 : 0;
-
-		ImGui::Text("UI Tick: %u", state.mumble_data.UITick);
+			context.IsMapOpen = map_open;
+		ImGui::Text("UI Tick: %u", state.mumble.UITick);
 
 		ImGui::Spacing();
-		ImGui::Text("Nexus Link");
+		ImGui::TextUnformatted("Nexus Link");
 		ImGui::Separator();
-		ImGui::Text("Window: %ux%u", state.nexus_link_data.Width, state.nexus_link_data.Height);
-		ImGui::Text("Scaling: %.1f", state.nexus_link_data.Scaling);
-		for (auto [width, height] : { std::pair{ 1280, 800 }, std::pair{ 1920, 1080 }, std::pair{ 860, 480 } })
+		const auto& link = state.nexus_link;
+		ImGui::Text("Window: %ux%u, scaling %.2f", link.Width, link.Height, link.Scaling);
+		for (const auto [width, height] : { std::pair{ 1280, 800 }, std::pair{ 1920, 1080 }, std::pair{ 860, 480 } })
 		{
-			auto label = std::to_string(width) + "x" + std::to_string(height);
-			if (ImGui::Button(label.c_str()) && !resize_client_area(hwnd, width, height))
-				printf("[MOCK] ERROR: Failed to resize client area (error %lu).\n", GetLastError());
+			const auto label = std::to_string(width) + "x" + std::to_string(height);
+			if (ImGui::Button(label.c_str()))
+				requested_size = { width, height };
 			ImGui::SameLine();
 		}
 		ImGui::NewLine();
 
 		ImGui::Spacing();
-		ImGui::Text("Keybinds");
+		ImGui::TextUnformatted("Input Binds");
 		ImGui::Separator();
-
-		auto keybinds = state.keybinds;
-		for (auto& entry : keybinds)
+		for (const auto& [id, bind] : binds)
 		{
-			ImGui::Text("%s (%s)", entry.id.c_str(), entry.keybind_string.c_str());
-			ImGui::SameLine();
-			auto btn_label = "Invoke##" + entry.id;
-			if (ImGui::SmallButton(btn_label.c_str()))
+			ImGui::PushID(id.c_str());
+			if (ImGui::SmallButton("Invoke"))
 			{
-				invoke_keybind(entry.id.c_str(), false);
-				invoke_keybind(entry.id.c_str(), true);
+				invoke_input_bind(id, false);
+				invoke_input_bind(id, true);
 			}
+			ImGui::SameLine();
+			ImGui::Text("%s: %s", id.c_str(), bind.c_str());
+			ImGui::PopID();
 		}
 
 		ImGui::Spacing();
-		ImGui::Text("Events");
+		ImGui::TextUnformatted("Events");
 		ImGui::Separator();
-		if (state.events_subscribers.empty())
-		{
+		if (events.empty())
 			ImGui::TextDisabled("(none)");
-		}
-		else
-		{
-			for (auto& [event_name, subs] : state.events_subscribers)
-				ImGui::Text("%s (%zu)", event_name.c_str(), subs.size());
-		}
+		for (const auto& [id, count] : events)
+			ImGui::Text("%s (%zu)", id.c_str(), count);
 
 		ImGui::Spacing();
-		ImGui::Text("Close On Escape");
+		ImGui::TextUnformatted("Close On Escape");
 		ImGui::Separator();
-		if (state.close_on_escape.empty())
-		{
-			ImGui::TextDisabled("(none)");
-		}
-		else
-		{
-			for (auto& [id, pBool] : state.close_on_escape)
-				ImGui::Text("%s: %s", id.c_str(), (pBool && *pBool) ? "open" : "closed");
-		}
+		for (const auto& [name, visible] : windows)
+			ImGui::Text("%s: %s", name.c_str(), visible ? "open" : "closed");
 
 		ImGui::Spacing();
-		ImGui::Text("Callbacks");
+		ImGui::TextUnformatted("Render Callbacks");
 		ImGui::Separator();
-		ImGui::Text("Pre-render: %zu", state.pre_render_callbacks.size());
-		ImGui::Text("Render: %zu", state.render_callbacks.size());
-		ImGui::Text("Post-render: %zu", state.post_render_callbacks.size());
-		ImGui::Text("Options: %zu", state.options_render_callbacks.size());
+		ImGui::Text("Pre: %zu, render: %zu, post: %zu, options: %zu", render_counts[0], render_counts[1], render_counts[2], render_counts[3]);
 	}
 	ImGui::End();
-
-	auto options_cbs = state.options_render_callbacks;
-	if (!options_cbs.empty())
-	{
-		ImGui::SetNextWindowPos(ImVec2(10, 270), ImGuiCond_FirstUseEver);
-		ImGui::SetNextWindowSize(ImVec2(600, 400), ImGuiCond_FirstUseEver);
-		if (ImGui::Begin("Addon Options"))
-		{
-			for (auto& cb : options_cbs)
-				cb();
-		}
-		ImGui::End();
-	}
 }
 
 // --- Entry point ---
 
-int main(int argc, char* argv[])
+static std::atomic<bool> s_toggle_menu = false;
+static std::atomic<bool> s_toggle_ui = false;
+
+// runs on the input bind worker like any handler, so the render loop applies the toggles
+static void on_nexus_input_bind(const char* id, bool release)
 {
-	LaunchOptions launch_options;
-	if (!parse_launch_options(argc, argv, launch_options))
-	{
-		print_usage();
-		return 1;
-	}
+	if (release)
+		return;
+	if (std::string_view(id) == "KB_MENU")
+		s_toggle_menu = true;
+	else if (std::string_view(id) == "KB_TOGGLEHIDEUI")
+		s_toggle_ui = true;
+}
 
-	const char* dll_path = launch_options.dll_path;
-
-	if (!std::filesystem::exists(dll_path))
-	{
-		printf("[MOCK] ERROR: File not found: %s\n", dll_path);
-		return 1;
-	}
-	for (const auto& font_file : { launch_options.font_file, launch_options.heading_font_file })
-	{
-		if (font_file.empty()) continue;
-		std::error_code error;
-		if (!std::filesystem::is_regular_file(font_file, error))
-		{
-			printf("[MOCK] ERROR: Font file not found: %s\n", font_file.c_str());
-			return 1;
-		}
-	}
-
-	printf("[MOCK] Starting Nexus Mock...\n");
-
-	// Create data directory in the working directory
-	std::filesystem::create_directories("data");
-
-	// Create window
-	WNDCLASSEX wc = { sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"NexusMock", nullptr };
-	RegisterClassEx(&wc);
-
-	// Build window title from DLL name
-	auto dll_name = std::filesystem::path(dll_path).stem().string();
-	auto title = "Nexus Mock - " + dll_name;
-	std::wstring wide_title(title.begin(), title.end());
-	const wchar_t* wide_title_text = wide_title.c_str();
-
-	HWND hwnd = CreateWindow(wc.lpszClassName, wide_title_text, WS_OVERLAPPEDWINDOW, 100, 100, 1280, 800, nullptr, nullptr, wc.hInstance, nullptr);
-
-	if (!CreateDeviceD3D(hwnd))
-	{
-		printf("[MOCK] ERROR: Failed to create D3D11 device.\n");
-		CleanupDeviceD3D();
-		DestroyWindow(hwnd);
-		UnregisterClass(wc.lpszClassName, wc.hInstance);
-		return 1;
-	}
-
-	ShowWindow(hwnd, SW_SHOWDEFAULT);
-	UpdateWindow(hwnd);
-
-	// Setup ImGui
-	IMGUI_CHECKVERSION();
-	ImGuiContext* ctx = ImGui::CreateContext();
-	ImGuiIO& io = ImGui::GetIO();
-	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-	ImGui::StyleColorsDark();
-
-	ImGui_ImplWin32_Init(hwnd);
-	ImGui_ImplDX11_Init(g_device, g_context);
-
-	// Populate mock state
+static int run(HWND hwnd, const LaunchOptions& options, AddonAPI_t* api)
+{
 	auto& state = get_mock_state();
 
-	RECT client_rect;
-	GetClientRect(hwnd, &client_rect);
-	state.nexus_link_data.Width = client_rect.right - client_rect.left;
-	state.nexus_link_data.Height = client_rect.bottom - client_rect.top;
-	state.nexus_link_data.Scaling = 1.0f;
-	state.nexus_link_data.IsGameplay = true;
-	populate_mumble(state);
+	// what Nexus registers before any addon: its menu and hide binds, its window and its quick access shortcut
+	bool menu_open = false;
+	bool ui_visible = true;
+	api->InputBinds_RegisterWithString("KB_MENU", on_nexus_input_bind, "CTRL+O");
+	api->InputBinds_RegisterWithString("KB_TOGGLEHIDEUI", on_nexus_input_bind, "CTRL+H");
+	api->GUI_RegisterCloseOnEscape("Nexus", &menu_open);
+	api->QuickAccess_Add(NexusShortcut, "ICON_NEXUS", "ICON_NEXUS_HOVER", "KB_MENU", "Nexus");
 
-	// Keep the default body stable for scripted tests; optional fonts match Nexus's native sizes.
-	ImFont* body_font = launch_options.font_file.empty() ? io.Fonts->AddFontDefault() : io.Fonts->AddFontFromFileTTF(launch_options.font_file.c_str(), 15.f);
-	const auto& heading_font_file = launch_options.heading_font_file.empty() ? launch_options.font_file : launch_options.heading_font_file;
-	ImFontConfig heading_config;
-	heading_config.SizePixels = 24.f;
-	ImFont* heading_font = heading_font_file.empty() ? io.Fonts->AddFontDefault(&heading_config) : io.Fonts->AddFontFromFileTTF(heading_font_file.c_str(), 24.f);
-	if (!body_font || !heading_font || !io.Fonts->Build())
-	{
-		printf("[MOCK] ERROR: Could not build the font atlas.\n");
-		ImGui_ImplDX11_Shutdown();
-		ImGui_ImplWin32_Shutdown();
-		ImGui::DestroyContext();
-		CleanupDeviceD3D();
-		DestroyWindow(hwnd);
-		UnregisterClass(wc.lpszClassName, wc.hInstance);
+	const auto addon = load_addon(options.addon);
+	if (!addon.module)
 		return 1;
-	}
-	io.FontDefault = body_font;
-	state.nexus_link_data.Font = body_font;
-	state.nexus_link_data.FontBig = heading_font;
-	state.nexus_link_data.FontUI = body_font;
-	printf("[MOCK] Fonts: body %.0f px (%s), heading %.0f px (%s)\n", body_font->FontSize, launch_options.font_file.empty() ? "default" : launch_options.font_file.c_str(), heading_font->FontSize, heading_font_file.empty() ? "default" : heading_font_file.c_str());
 
-	// Create mock API and inject D3D11/ImGui context
-	set_mock_device(g_device);
-	AddonAPI* mock_api = create_mock_api();
-	mock_api->SwapChain = g_swap_chain;
-	mock_api->ImguiContext = ctx;
-
-	static auto imgui_malloc = [](size_t sz, void*) -> void* { return malloc(sz); };
-	static auto imgui_free = [](void* ptr, void*) { free(ptr); };
-	mock_api->ImguiMalloc = reinterpret_cast<void*>(+imgui_malloc);
-	mock_api->ImguiFree = reinterpret_cast<void*>(+imgui_free);
-
-	// Load the addon DLL
-	auto addon = load_addon_dll(dll_path);
-	if (!addon.handle || !addon.definition || !addon.definition->Load)
-	{
-		printf("[MOCK] ERROR: Failed to load addon.\n");
-		ImGui_ImplDX11_Shutdown();
-		ImGui_ImplWin32_Shutdown();
-		ImGui::DestroyContext();
-		CleanupDeviceD3D();
-		DestroyWindow(hwnd);
-		UnregisterClass(wc.lpszClassName, wc.hInstance);
-		return 1;
-	}
-
-	printf("[MOCK] Initializing addon...\n");
-	addon.definition->Load(mock_api);
-	invoke_startup_keybinds(launch_options.keybinds_to_invoke);
-	printf("[MOCK] Addon initialized. Starting render loop.\n");
+	printf("[MOCK] Calling Load...\n");
+	set_addon_module(addon.module, addon.definition->Signature);
+	addon.definition->Load(api);
+	// Nexus raises these after every Load
+	raise_event(EV_ADDON_LOADED, &addon.definition->Signature);
+	raise_event(EV_MUMBLE_IDENTITY_UPDATED, &state.identity);
 
 	TestScenario scenario;
-	if (!scenario.load(launch_options.test_script))
+	bool failed = !scenario.load(options.test_script);
+	for (const auto& id : options.input_binds)
 	{
-		printf("[MOCK] Invalid test script.\n");
-		scenario.failed = true;
-		PostQuitMessage(1);
+		printf("[MOCK] Invoking input bind: %s\n", id.c_str());
+		if (!invoke_input_bind(id, false) || !invoke_input_bind(id, true))
+		{
+			printf("[MOCK] ERROR: The addon has no input bind %s.\n", id.c_str());
+			failed = true;
+		}
 	}
+	wait_for_input_binds();
 
-	// Render loop
-	const float clear_color[4] = { 0.1f, 0.1f, 0.1f, 1.0f };
-	MSG msg;
-	ZeroMemory(&msg, sizeof(msg));
-	while (msg.message != WM_QUIT)
+	const float clear_color[4] = { 0.1f, 0.1f, 0.1f, 1.f };
+	SIZE requested_size{};
+	bool done = failed;
+	while (!done)
 	{
-		if (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE))
+		MSG msg;
+		while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
 		{
 			TranslateMessage(&msg);
-			DispatchMessage(&msg);
-			continue;
+			DispatchMessageW(&msg);
+			done |= msg.message == WM_QUIT;
 		}
+		if (done)
+			break;
 
-		GetClientRect(hwnd, &client_rect);
-		state.nexus_link_data.Width = client_rect.right - client_rect.left;
-		state.nexus_link_data.Height = client_rect.bottom - client_rect.top;
-		state.mumble_data.UITick++;
+		if (s_toggle_menu.exchange(false))
+			menu_open = !menu_open;
+		if (s_toggle_ui.exchange(false))
+			ui_visible = !ui_visible;
 
-		ImGui_ImplDX11_NewFrame();
-		ImGui_ImplWin32_NewFrame();
-		scenario.before_frame(mock_api->Textures.GetOrCreateFromFile);
-		ImGui::NewFrame();
-		scenario.begin_frame();
-
-		flush_pending_texture_uploads();
-
-		auto pre_cbs = state.pre_render_callbacks;
-		auto render_cbs = state.render_callbacks;
-		auto post_cbs = state.post_render_callbacks;
-
-		for (auto& cb : pre_cbs)
-			cb();
-
-		if (!launch_options.hide_mock_controls)
-			render_mock_controls(hwnd);
-
-		for (auto& cb : render_cbs)
-			cb();
-
-		render_quick_access();
-		render_alerts();
-
-		for (auto& cb : post_cbs)
-			cb();
-
-		ImGui::Render();
-
+		// the game's part of the frame: Mumble ticks and the scene is drawn
+		state.mumble.UITick++;
 		if (g_render_target)
 		{
 			g_context->OMSetRenderTargets(1, &g_render_target, nullptr);
 			g_context->ClearRenderTargetView(g_render_target, clear_color);
+		}
+
+		// Nexus's part: textures, strings and fonts, then the callbacks around its ImGui frame
+		bool fonts_rebuilt = false;
+		if (!advance_mock_api(fonts_rebuilt))
+		{
+			failed = true;
+			break;
+		}
+		if (fonts_rebuilt)
+			ImGui_ImplDX11_InvalidateDeviceObjects();
+
+		for (auto callback : callbacks(&MockState::pre_render))
+			callback();
+
+		ImGui_ImplDX11_NewFrame();
+		ImGui_ImplWin32_NewFrame();
+		scenario.before_frame(hwnd);
+		ImGui::NewFrame();
+		if (ui_visible)
+		{
+			for (auto callback : callbacks(&MockState::render))
+				callback();
+			render_alerts();
+			render_nexus_window(menu_open, addon.definition->Name);
+			render_quick_access();
+		}
+		if (!options.hide_controls)
+			render_mock_controls(requested_size);
+		ImGui::Render();
+		if (g_render_target)
+		{
+			g_context->OMSetRenderTargets(1, &g_render_target, nullptr);
 			ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 		}
 
-		if (scenario.after_frame(g_device, g_context, g_swap_chain, state.textures))
-			PostQuitMessage(scenario.failed ? 1 : 0);
-		g_swap_chain->Present(1, 0);
+		for (auto callback : callbacks(&MockState::post_render))
+			callback();
+
+		done = scenario.after_frame(g_device, g_context, g_swap_chain);
+		// a minimized window presents without waiting for the display, which would spin the loop
+		if (g_swap_chain->Present(1, 0) == DXGI_STATUS_OCCLUDED)
+			Sleep(10);
+		if (requested_size.cx > 0)
+		{
+			if (!resize_client_area(hwnd, requested_size.cx, requested_size.cy))
+				printf("[MOCK] ERROR: Cannot resize the client area (error %lu).\n", GetLastError());
+			requested_size = {};
+		}
 	}
 
-	// Cleanup
-	printf("[MOCK] Unloading addon...\n");
+	// Nexus calls Unload, drops what the addon left registered and frees it. Quitting raises no EV_ADDON_UNLOADED.
+	printf("[MOCK] Calling Unload...\n");
+	wait_for_input_binds();
 	if (addon.definition->Unload)
 		addon.definition->Unload();
-	FreeLibrary(addon.handle);
+	if (const auto left = release_addon_module())
+		printf("[MOCK] WARN: The addon left %zu callbacks registered, the mock removed them.\n", left);
+	wait_for_input_binds();
+	FreeLibrary(addon.module);
+	return failed || scenario.failed ? 1 : 0;
+}
 
-	ImGui_ImplDX11_Shutdown();
-	ImGui_ImplWin32_Shutdown();
-	ImGui::DestroyContext();
+int main(int argc, char* argv[])
+{
+	LaunchOptions options;
+	if (!parse_launch_options(argc, argv, options))
+	{
+		print_usage();
+		return 1;
+	}
+	std::error_code error;
+	if (!std::filesystem::is_regular_file(options.addon, error))
+	{
+		printf("[MOCK] ERROR: File not found: %s\n", options.addon.string().c_str());
+		return 1;
+	}
+
+	// The data folder stands in for the game directory, with the folders Nexus creates at startup
+	const auto game_directory = std::filesystem::absolute("data");
+	std::filesystem::create_directories(game_directory / "addons" / "common", error);
+	if (error)
+	{
+		printf("[MOCK] ERROR: Cannot create %s: %s\n", (game_directory / "addons" / "common").string().c_str(), error.message().c_str());
+		return 1;
+	}
+
+	printf("[MOCK] Starting Nexus Mock...\n");
+	WNDCLASSEXW window_class = { sizeof(window_class), CS_CLASSDC, WndProc, 0, 0, GetModuleHandleW(nullptr), nullptr, LoadCursorW(nullptr, IDC_ARROW), nullptr, nullptr, L"NexusMock", nullptr };
+	RegisterClassExW(&window_class);
+	const auto title = L"Nexus Mock - " + options.addon.stem().wstring();
+	HWND hwnd = CreateWindowW(window_class.lpszClassName, title.c_str(), WS_OVERLAPPEDWINDOW, 100, 100, 1280, 800, nullptr, nullptr, window_class.hInstance, nullptr);
+
+	int result = 1;
+	if (hwnd && resize_client_area(hwnd, 1280, 800) && CreateDeviceD3D(hwnd))
+	{
+		ShowWindow(hwnd, SW_SHOWDEFAULT);
+		UpdateWindow(hwnd);
+
+		IMGUI_CHECKVERSION();
+		ImGui::CreateContext();
+		// scripted runs start from the same window layout every time
+		if (!options.test_script.empty())
+			ImGui::GetIO().IniFilename = nullptr;
+		ImGui::StyleColorsDark();
+		ImGui_ImplWin32_Init(hwnd);
+		ImGui_ImplDX11_Init(g_device, g_context);
+
+		auto* api = create_mock_api(game_directory, g_device, g_swap_chain);
+		RECT client;
+		GetClientRect(hwnd, &client);
+		update_nexus_link(client.right - client.left, client.bottom - client.top);
+		if (add_nexus_fonts(options.font_file, options.heading_font_file))
+			result = run(hwnd, options, api);
+		shutdown_mock_api();
+
+		ImGui_ImplDX11_Shutdown();
+		ImGui_ImplWin32_Shutdown();
+		ImGui::DestroyContext();
+	}
+	else
+		printf("[MOCK] ERROR: Cannot create the window and its D3D11 device.\n");
 
 	CleanupDeviceD3D();
-	DestroyWindow(hwnd);
-	UnregisterClass(wc.lpszClassName, wc.hInstance);
-
-	return scenario.failed ? 1 : 0;
+	if (hwnd)
+		DestroyWindow(hwnd);
+	UnregisterClassW(window_class.lpszClassName, window_class.hInstance);
+	return result;
 }
